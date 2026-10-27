@@ -238,6 +238,7 @@ typedef struct JSObject JSObject;
 typedef enum {
     JS_GC_PHASE_NONE,
     JS_GC_PHASE_DECREF,
+    JS_GC_PHASE_SCAN, /* WeakMap values are not marked (see gc_scan()) */
     JS_GC_PHASE_REMOVE_CYCLES,
 } JSGCPhaseEnum;
 
@@ -343,6 +344,8 @@ struct JSRuntime {
     /* list of JSGCObjectHeader.link. Used during JS_FreeValueRT() */
     struct list_head gc_zero_ref_count_list;
     struct list_head tmp_obj_list; /* used during GC */
+    /* list of JSMapState.gc_link. Live WeakMaps/WeakSets found during gc_scan() */
+    struct list_head gc_weak_map_list;
     JSGCPhaseEnum gc_phase : 8;
     size_t malloc_gc_threshold;
     struct list_head weakref_list; /* list of JSWeakRefHeader.link */
@@ -1091,6 +1094,7 @@ struct JSObject {
 typedef struct JSMapRecord {
     int ref_count; /* used during enumeration to avoid freeing the record */
     BOOL empty : 8; /* TRUE if the record is deleted */
+    BOOL value_marked : 8; /* used during GC for weak maps */
     struct list_head link;
     struct JSMapRecord *hash_next;
     JSValue key;
@@ -1107,6 +1111,7 @@ typedef struct JSMapState {
     uint32_t record_count_threshold; /* count at which a hash table
                                         resize is needed */
     JSWeakRefHeader weakref_header; /* only used if is_weak = TRUE */
+    struct list_head gc_link; /* only used during gc_scan() if is_weak = TRUE */
 } JSMapState;
 
 enum {
@@ -1413,6 +1418,8 @@ static JSValue JS_InstantiateFunctionListItem2(JSContext *ctx, JSObject *p,
 static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int is_map);
 static void map_delete_weakrefs(JSRuntime *rt, JSWeakRefHeader *wh);
+static void gc_mark_weak_map_values(JSRuntime *rt);
+static void gc_remove_dead_weak_map_records(JSRuntime *rt);
 static void weakref_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh);
 static void finrec_delete_weakref(JSRuntime *rt, JSWeakRefHeader *wh);
 static void JS_RunGCInternal(JSRuntime *rt, BOOL remove_weak_objects);
@@ -6849,13 +6856,31 @@ static void gc_scan(JSRuntime *rt)
     struct list_head *el;
     JSGCObjectHeader *p;
 
-    /* keep the objects with a refcount > 0 and their children. */
-    list_for_each(el, &rt->gc_obj_list) {
-        p = list_entry(el, JSGCObjectHeader, link);
-        assert(js_rc(p)->ref_count > 0);
-        js_rc(p)->mark = 0; /* reset the mark for the next GC call */
-        mark_children(rt, p, gc_scan_incref_child);
+    /* keep the objects with a refcount > 0 and their children. The
+       WeakMap values are only kept if their key is kept (ephemeron
+       semantics), so the scan is repeated until no new object is
+       kept. New objects are added at the end of gc_obj_list. */
+    init_list_head(&rt->gc_weak_map_list);
+    rt->gc_phase = JS_GC_PHASE_SCAN;
+    el = &rt->gc_obj_list;
+    for(;;) {
+        while (el->next != &rt->gc_obj_list) {
+            el = el->next;
+            p = list_entry(el, JSGCObjectHeader, link);
+            assert(js_rc(p)->ref_count > 0);
+            js_rc(p)->mark = 0; /* reset the mark for the next GC call */
+            mark_children(rt, p, gc_scan_incref_child);
+        }
+        gc_mark_weak_map_values(rt);
+        /* stop if gc_mark_weak_map_values() did not keep any new object */
+        if (el->next == &rt->gc_obj_list)
+            break;
     }
+    rt->gc_phase = JS_GC_PHASE_NONE;
+
+    /* the records of the live WeakMaps whose key is not kept are
+       removed so that their value can be freed with the cycles */
+    gc_remove_dead_weak_map_records(rt);
 
     /* restore the refcount of the objects to be deleted. */
     list_for_each(el, &rt->tmp_obj_list) {
@@ -54553,6 +54578,7 @@ static JSMapRecord *map_add_record(JSContext *ctx, JSMapState *s,
         return NULL;
     mr->ref_count = 1;
     mr->empty = FALSE;
+    mr->value_marked = FALSE;
     if (s->is_weak) {
         mr->key = js_weakref_new(ctx, key);
     } else {
@@ -54614,35 +54640,40 @@ static void map_decref_record(JSRuntime *rt, JSMapRecord *mr)
     }
 }
 
+/* delete a weak map record whose key is not live */
+static void map_delete_weak_record(JSRuntime *rt, JSMapState *s, JSMapRecord *mr)
+{
+    JSMapRecord *mr1, **pmr;
+    uint32_t h;
+
+    /* even if key is not live it can be hashed as a pointer */
+    h = map_hash_key(mr->key, s->hash_bits);
+    pmr = &s->hash_table[h];
+    for(;;) {
+        mr1 = *pmr;
+        /* the entry may already be removed from the hash
+           table if the map was resized */
+        if (mr1 == NULL)
+            goto done;
+        if (mr1 == mr)
+            break;
+        pmr = &mr1->hash_next;
+    }
+    /* remove from the hash table */
+    *pmr = mr1->hash_next;
+ done:
+    map_delete_record_internal(rt, s, mr);
+}
+
 static void map_delete_weakrefs(JSRuntime *rt, JSWeakRefHeader *wh)
 {
     JSMapState *s = container_of(wh, JSMapState, weakref_header);
     struct list_head *el, *el1;
-    JSMapRecord *mr1, **pmr;
-    uint32_t h;
 
     list_for_each_safe(el, el1, &s->records) {
         JSMapRecord *mr = list_entry(el, JSMapRecord, link);
-        if (!js_weakref_is_live(mr->key)) {
-
-            /* even if key is not live it can be hashed as a pointer */
-            h = map_hash_key(mr->key, s->hash_bits);
-            pmr = &s->hash_table[h];
-            for(;;) {
-                mr1 = *pmr;
-                /* the entry may already be removed from the hash
-                   table if the map was resized */
-                if (mr1 == NULL)
-                    goto done; 
-                if (mr1 == mr)
-                    break;
-                pmr = &mr1->hash_next;
-            }
-            /* remove from the hash table */
-            *pmr = mr1->hash_next;
-        done:
-            map_delete_record_internal(rt, s, mr);
-        }
+        if (!js_weakref_is_live(mr->key))
+            map_delete_weak_record(rt, s, mr);
     }
 }
 
@@ -55014,6 +55045,11 @@ static void js_map_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
 
     s = p->u.map_state;
     if (s) {
+        if (s->is_weak && rt->gc_phase == JS_GC_PHASE_SCAN) {
+            /* the values are marked by gc_mark_weak_map_values() */
+            list_add_tail(&s->gc_link, &rt->gc_weak_map_list);
+            return;
+        }
         list_for_each(el, &s->records) {
             mr = list_entry(el, JSMapRecord, link);
             if (!s->is_weak)
@@ -55021,6 +55057,52 @@ static void js_map_mark(JSRuntime *rt, JSValueConst val, JS_MarkFunc *mark_func)
             JS_MarkValue(rt, mr->value, mark_func);
         }
     }
+}
+
+/* mark the values of the live weak maps whose key is live */
+static void gc_mark_weak_map_values(JSRuntime *rt)
+{
+    struct list_head *el, *el1;
+    JSMapState *s;
+    JSMapRecord *mr;
+
+    list_for_each(el, &rt->gc_weak_map_list) {
+        s = list_entry(el, JSMapState, gc_link);
+        list_for_each(el1, &s->records) {
+            mr = list_entry(el1, JSMapRecord, link);
+            if (!mr->empty && !mr->value_marked &&
+                js_weakref_is_live(mr->key)) {
+                mr->value_marked = TRUE;
+                JS_MarkValue(rt, mr->value, gc_scan_incref_child);
+            }
+        }
+    }
+}
+
+/* remove the records of the live weak maps whose key is not live. Their
+   value was not marked so its reference was already removed by
+   gc_decref(). */
+static void gc_remove_dead_weak_map_records(JSRuntime *rt)
+{
+    struct list_head *el, *el1, *el2;
+    JSMapState *s;
+    JSMapRecord *mr;
+
+    list_for_each(el, &rt->gc_weak_map_list) {
+        s = list_entry(el, JSMapState, gc_link);
+        list_for_each_safe(el1, el2, &s->records) {
+            mr = list_entry(el1, JSMapRecord, link);
+            if (mr->value_marked) {
+                mr->value_marked = FALSE;
+            } else if (!mr->empty) {
+                /* the other values are not GC objects and are freed normally */
+                if (JS_VALUE_GET_TAG(mr->value) == JS_TAG_OBJECT)
+                    mr->value = JS_UNDEFINED;
+                map_delete_weak_record(rt, s, mr);
+            }
+        }
+    }
+    init_list_head(&rt->gc_weak_map_list);
 }
 
 /* Map Iterator */
